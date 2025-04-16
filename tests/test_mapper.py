@@ -1,12 +1,17 @@
 import enum
 import textwrap
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import pytest
 import strawberry
 from sqlalchemy import JSON, Column, Enum, ForeignKey, Integer, String
 from sqlalchemy.dialects.postgresql.array import ARRAY
-from sqlalchemy.orm import relationship
+from sqlalchemy.ext.associationproxy import AssociationProxy
+from sqlalchemy.ext.hybrid import hybrid_property
+from sqlalchemy.orm import (
+    RelationshipProperty,
+    relationship,
+)
 from strawberry.scalars import JSON as StrawberryJSON
 from strawberry.types.base import StrawberryList, StrawberryOptional
 from strawberry_sqlalchemy_mapper import StrawberrySQLAlchemyMapper
@@ -343,6 +348,92 @@ def test_relationships_schema(employee_and_department_tables, mapper):
       name: String!
       departmentId: Int
       department: Department
+    }
+
+    type EmployeeConnection {
+      """Pagination data for this connection"""
+      pageInfo: PageInfo!
+      edges: [EmployeeEdge!]!
+    }
+
+    type EmployeeEdge {
+      """A cursor for use in pagination"""
+      cursor: String!
+
+      """The item at the end of the edge"""
+      node: Employee!
+    }
+
+    """Information to aid in pagination."""
+    type PageInfo {
+      """When paginating forwards, are there more items?"""
+      hasNextPage: Boolean!
+
+      """When paginating backwards, are there more items?"""
+      hasPreviousPage: Boolean!
+
+      """When paginating backwards, the cursor to continue."""
+      startCursor: String
+
+      """When paginating forwards, the cursor to continue."""
+      endCursor: String
+    }
+
+    type Query {
+      departments: Department!
+    }
+    '''
+    assert str(schema) == textwrap.dedent(expected).strip()
+
+
+def test_relationships_schema_with_property_name_mapper(employee_and_department_tables):
+    EmployeeModel, DepartmentModel = employee_and_department_tables
+
+    def property_name_mapper(
+        name: str,
+        property: Union[
+            RelationshipProperty, AssociationProxy, hybrid_property, Column
+        ],
+    ) -> str:
+        if isinstance(property, RelationshipProperty):
+            return f"{name}_rel"
+        elif isinstance(property, AssociationProxy):
+            return f"{name}_assoc"
+        elif isinstance(property, hybrid_property):
+            return f"{name}_hybrid"
+        else:
+            return f"{name}_col"
+
+    mapper = StrawberrySQLAlchemyMapper(property_name_mapper=property_name_mapper)
+
+    @mapper.type(EmployeeModel)
+    class Employee:
+        __exclude__ = ["password_hash"]
+
+    @mapper.type(DepartmentModel)
+    class Department:
+        pass
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def departments(self) -> Department: ...
+
+    mapper.finalize()
+    schema = strawberry.Schema(query=Query)
+
+    expected = '''
+    type Department {
+      idCol: Int!
+      nameCol: String!
+      employeesRel: EmployeeConnection!
+    }
+
+    type Employee {
+      idCol: Int!
+      nameCol: String!
+      departmentIdCol: Int
+      departmentRel: Department
     }
 
     type EmployeeConnection {
