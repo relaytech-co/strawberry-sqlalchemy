@@ -45,13 +45,13 @@ class StrawberrySQLAlchemyLoader:
                 "One of bind or async_bind_factory must be set for loader to function properly."
             )
 
-    async def _scalars_all(self, *args, **kwargs):
+    async def _execute(self, *args, **kwargs):
         if self._async_bind_factory:
             async with self._async_bind_factory() as bind:
-                return (await bind.scalars(*args, **kwargs)).all()
+                return await bind.execute(*args, **kwargs)
         else:
             assert self._bind is not None
-            return self._bind.scalars(*args, **kwargs).all()
+            return self._bind.execute(*args, **kwargs)
 
     def loader_for(self, relationship: RelationshipProperty) -> DataLoader:
         """
@@ -63,27 +63,48 @@ class StrawberrySQLAlchemyLoader:
             related_model = relationship.entity.entity
 
             async def load_fn(keys: List[Tuple]) -> List[Any]:
-                query = select(related_model).filter(
-                    tuple_(
-                        *[remote for _, remote in relationship.local_remote_pairs or []]
-                    ).in_(keys)
+                # To handle both, we:
+                # 1. Filter on remote columns in the relationship which are the other side of any local columns
+                #       i.e. The join in the relationship from the source table
+                # 2. Return the values of the
+
+                # We get the other side of the first jump in the relationship - i.e. the join from the local table columns
+                # If there are any other relationships, we join on those
+                # This covers us for the cases where there is a many to many relationship
+
+                # We filter on remote columns in the relationship which are the other side of any local columns
+                #   i.e. The join in the relationship from the source table
+                remote_cols_for_where = [
+                    remote
+                    for local, remote in relationship.local_remote_pairs or []
+                    if local in relationship.local_columns and remote.key
+                ]
+
+                # We join on any other pairs in the relationship which aren't associated with the local columns
+                # This covers the many to many case
+                non_local_pairs = [
+                    (local, remote)
+                    for local, remote in relationship.local_remote_pairs or []
+                    if local not in relationship.local_columns
+                ]
+
+                # For each row we return both the target model and the values of the columns which we filtered on
+                query = select(related_model, *remote_cols_for_where).filter(
+                    tuple_(*remote_cols_for_where).in_(keys)
                 )
+
+                for local, remote in non_local_pairs:
+                    query = query.join(remote.table, local == remote)
+
                 if relationship.order_by:
                     query = query.order_by(*relationship.order_by)
-                rows = await self._scalars_all(query)
+                result = await self._execute(query)
 
-                def group_by_remote_key(row: Any) -> Tuple:
-                    return tuple(
-                        [
-                            getattr(row, remote.key)
-                            for _, remote in relationship.local_remote_pairs or []
-                            if remote.key
-                        ]
-                    )
+                rows = result.tuples().all()
 
                 grouped_keys: Mapping[Tuple, List[Any]] = defaultdict(list)
-                for row in rows:
-                    grouped_keys[group_by_remote_key(row)].append(row)
+                for target_entity, *cols_filtered_on in rows:
+                    grouped_keys[tuple(cols_filtered_on)].append(target_entity)
                 if relationship.uselist:
                     return [grouped_keys[key] for key in keys]
                 else:

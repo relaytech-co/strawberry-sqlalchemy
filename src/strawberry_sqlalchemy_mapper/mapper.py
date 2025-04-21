@@ -532,11 +532,12 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
             else:
                 relationship_key = tuple(
                     [
-                        getattr(self, local.key)
-                        for local, _ in relationship.local_remote_pairs or []
-                        if local.key
+                        getattr(self, col.key)
+                        for col in relationship.local_columns or []
+                        if col.key
                     ]
                 )
+
                 if any(item is None for item in relationship_key):
                     if relationship.uselist:
                         return []
