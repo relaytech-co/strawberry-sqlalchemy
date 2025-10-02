@@ -1,6 +1,327 @@
 CHANGELOG
 =========
 
+0.7.0 - 2025-08-07
+------------------
+
+Implement Relay-style cursor pagination for SQLAlchemy relationships by extending the connection resolver and DataLoader to accept pagination arguments, computing pageInfo metadata, and introducing cursor utilities. Add PaginatedLoader to scope DataLoader instances per pagination parameters and update tests to verify pagination behavior.
+
+**New Features**:
+- Support cursor-based pagination (first, after, last, before) on GraphQL relationship fields
+- Introduce PaginatedLoader to manage DataLoader instances per pagination configuration
+
+**Enhancements**:
+- Extend connection resolvers to compute pageInfo fields (hasNextPage, hasPreviousPage, totalCount) and handle forward and backward pagination
+- Add utilities for cursor encoding/decoding and relationship key extraction
+
+**Tests**:
+- Add comprehensive tests for forward and backward pagination scenarios in both synchronous and asynchronous execution contexts
+
+**Examples**:
+
+Get the first three books for a specific author:
+
+```gql
+query {
+  author(id: 1) {
+    id
+    name
+    books(first: 3) {
+      edges {
+        node {
+          id
+          title
+        }
+      }
+      pageInfo {
+        hasNextPage
+        hasPreviousPage
+        startCursor
+        endCursor
+      }
+    }
+  }
+}
+```
+
+Get all books after a specific book's cursor:
+
+```gql
+query($afterBook: String) {
+  author(id: 1) {
+    id
+    name
+    books(after: $afterBook) {
+      edges {
+        node {
+          id
+          title
+        }
+      }
+      pageInfo {
+        hasNextPage
+        hasPreviousPage
+        startCursor
+        endCursor
+      }
+    }
+  }
+}
+```
+
+Get the first three books for a specific author after a specific book's cursor:
+
+```gql
+query($afterBook: String) {
+  author(id: 1) {
+    id
+    name
+    books(first: 3, after: $afterBook) {
+      edges {
+        node {
+          id
+          title
+        }
+      }
+      pageInfo {
+        hasNextPage
+        hasPreviousPage
+        startCursor
+        endCursor
+      }
+    }
+  }
+}
+```
+
+
+Get the last three books for a specific author:
+
+```gql
+query {
+  author(id: 1) {
+    id
+    name
+    books(last: 3) {
+      edges {
+        node {
+          id
+          title
+        }
+      }
+      pageInfo {
+        hasNextPage
+        hasPreviousPage
+        startCursor
+        endCursor
+      }
+    }
+  }
+}
+```
+
+Get all books before a specific book's cursor:
+
+```gql
+query($beforeBook: String) {
+  author(id: 1) {
+    id
+    name
+    books(before: $beforeBook) {
+      edges {
+        node {
+          id
+          title
+        }
+      }
+      pageInfo {
+        hasNextPage
+        hasPreviousPage
+        startCursor
+        endCursor
+      }
+    }
+  }
+}
+```
+
+Get the last three books for a specific author before a specific book's cursor:
+
+```gql
+query($beforeBook: String) {
+  author(id: 1) {
+    id
+    name
+    books(last: 3, before: $beforeBook) {
+      edges {
+        node {
+          id
+          title
+        }
+      }
+      pageInfo {
+        hasNextPage
+        hasPreviousPage
+        startCursor
+        endCursor
+      }
+    }
+  }
+}
+```
+
+Contributed by [David Roeca](https://github.com/davidroeca) via [PR #255](https://github.com/strawberry-graphql/strawberry-sqlalchemy/pull/255/)
+
+
+0.6.4 - 2025-07-08
+------------------
+
+This release improves how types inherit fields from other mapped types using `@mapper.type(...)`.
+You can now safely inherit from another mapped type, and the resulting GraphQL type will include all expected fields with predictable conflict resolution.
+
+Some examples:
+
+- Basic Inheritance:
+
+```python
+@mapper.type(ModelA)
+class ApiA:
+    pass
+
+
+@mapper.type(ModelB)
+class ApiB(ApiA):
+    # ApiB inherits all fields declared in ApiA
+    pass
+```
+
+
+- The `__exclude__` option continues working:
+
+```python
+@mapper.type(ModelA)
+class ApiA:
+    __exclude__ = ["relationshipB_id"]
+
+
+@mapper.type(ModelB)
+class ApiB(ApiA):
+    # ApiB will have all fields declared in ApiA, except "relationshipB_id"
+    pass
+```
+
+- If two SQLAlchemy models define fields with the same name, the field from the model inside `.type(...)` takes precedence:
+
+```python
+class ModelA(base):
+    __tablename__ = "a"
+
+    id = Column(String, primary_key=True)
+    example_field = Column(String(50))
+
+
+class ModelB(base):
+    __tablename__ = "b"
+
+    id = Column(String, primary_key=True)
+    example_field = Column(Integer, autoincrement=True)
+
+
+@mapper.type(ModelA)
+class ApiA:
+    # example_field will be a String
+    pass
+
+
+@mapper.type(ModelB)
+class ApiB(ApiA):
+    # example_field will be taken from ModelB and will be an Integer
+    pass
+```
+
+
+- If a field is explicitly declared in the mapped type, it will override any inherited or model-based definition:
+
+```python
+class ModelA(base):
+    __tablename__ = "a"
+
+    id = Column(String, primary_key=True)
+    example_field = Column(String(50))
+
+
+class ModelB(base):
+    __tablename__ = "b"
+
+    id = Column(String, primary_key=True)
+    example_field = Column(Integer, autoincrement=True)
+
+
+@mapper.type(ModelA)
+class ApiA:
+    pass
+
+
+@mapper.type(ModelB)
+class ApiB(ApiA):
+    # example_field will be a Float
+    example_field: float = strawberry.field(name="exampleField")
+```
+
+Contributed by [Luis Gustavo](https://github.com/Ckk3) via [PR #253](https://github.com/strawberry-graphql/strawberry-sqlalchemy/pull/253/)
+
+
+0.6.3 - 2025-06-21
+------------------
+
+This update helps verify compatibility with Python 3.13.
+
+- Added new test environments in the CI pipeline to ensure compatibility with Python 3.13.
+- No changes to runtime code or dependencies.
+
+Contributed by [Luis Gustavo](https://github.com/Ckk3) via [PR #254](https://github.com/strawberry-graphql/strawberry-sqlalchemy/pull/254/)
+
+
+0.6.2 - 2025-05-24
+------------------
+
+This release does not introduce any new features or bug fixes. It focuses solely on internal code quality improvements.
+
+Changes:
+- Added Mypy configuration aligned with the main Strawberry project.
+- Enforced type checking via CI to ensure consistency.
+- Ran pre-commit across all files to standardize formatting and follow the project's linting architecture.
+
+These changes aim to improve maintainability and ensure better development practices moving forward.
+
+Contributed by [Luis Gustavo](https://github.com/Ckk3) via [PR #250](https://github.com/strawberry-graphql/strawberry-sqlalchemy/pull/250/)
+
+
+0.6.1 - 2025-05-13
+------------------
+
+Ensure association proxy resolvers return valid relay connections, including `page_info` and edge `cursor` details, even for empty results.
+
+Thanks to https://github.com/tylernisonoff for the original PR.
+
+Contributed by [Luis Gustavo](https://github.com/Ckk3) via [PR #241](https://github.com/strawberry-graphql/strawberry-sqlalchemy/pull/241/)
+
+
+0.6.0 - 2025-04-25
+------------------
+
+**Added support for GraphQL directives** in the SQLAlchemy type mapper, enabling better integration with GraphQL federation.
+
+**Example usage:**
+```python
+@mapper.type(Employee, directives=["@deprecated(reason: 'Use newEmployee instead')"])
+class Employee:
+    pass
+```
+
+Contributed by [Cameron Sechrist](https://github.com/csechrist) via [PR #204](https://github.com/strawberry-graphql/strawberry-sqlalchemy/pull/204/)
+
+
 0.5.0 - 2024-11-12
 ------------------
 
@@ -127,5 +448,3 @@ Contributed by [Layton Wedgeworth](https://github.com/asimov-layton) via [PR #24
 Dependency version changes needed for python 3.12 compatibility.
 
 Contributed by [mattalbr](https://github.com/mattalbr) via [PR #35](https://github.com/strawberry-graphql/strawberry-sqlalchemy/pull/35/)
-
-

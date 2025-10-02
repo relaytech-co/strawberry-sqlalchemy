@@ -25,11 +25,14 @@ from typing import (
     NewType,
     Optional,
     Protocol,
+    Sequence,
     Set,
+    Tuple,
     Type,
     TypeVar,
     Union,
     cast,
+    get_type_hints,
     overload,
 )
 from typing_extensions import Self
@@ -68,14 +71,12 @@ from sqlalchemy.orm import (
     Mapper,
     RelationshipProperty,
 )
-from sqlalchemy.orm.state import InstanceState
 from sqlalchemy.sql.type_api import TypeEngine
 from strawberry import relay
 from strawberry.annotation import StrawberryAnnotation
 from strawberry.scalars import JSON as StrawberryJSON
 from strawberry.types import Info
 from strawberry.types.base import WithStrawberryObjectDefinition, get_object_definition
-from strawberry.types.field import StrawberryField
 from strawberry.types.lazy_type import LazyType
 from strawberry.types.private import is_private
 
@@ -87,6 +88,8 @@ from strawberry_sqlalchemy_mapper.exc import (
     UnsupportedDescriptorType,
 )
 from strawberry_sqlalchemy_mapper.field import field
+from strawberry_sqlalchemy_mapper.loader import StrawberrySQLAlchemyLoader
+from strawberry_sqlalchemy_mapper.pagination_cursor_utils import decode_cursor_index
 from strawberry_sqlalchemy_mapper.relay import (
     resolve_model_id,
     resolve_model_id_attr,
@@ -96,13 +99,13 @@ from strawberry_sqlalchemy_mapper.relay import (
 from strawberry_sqlalchemy_mapper.scalars import BigInt
 
 if TYPE_CHECKING:
-    from sqlalchemy.sql.expression import ColumnElement
+    from sqlalchemy.orm.state import InstanceState
+    from strawberry.types.field import StrawberryField
 
 BaseModelType = TypeVar("BaseModelType")
 
 SkipTypeSentinelT = NewType("SkipTypeSentinelT", object)
-SkipTypeSentinel = cast(SkipTypeSentinelT, sentinel.create("SkipTypeSentinel"))
-
+SkipTypeSentinel = cast("SkipTypeSentinelT", sentinel.create("SkipTypeSentinel"))
 
 #: Set on generated types to the original type handed to the decorator
 _ORIGINAL_TYPE_KEY = "_original_type"
@@ -125,6 +128,21 @@ class StrawberrySQLAlchemyLazy(LazyType):
     def resolve_type(self) -> Type[Any]:
         assert self.mapper is not None
         return self.mapper.mapped_types[self.type_name]
+
+
+def _get_loader_from_info(info: Info) -> StrawberrySQLAlchemyLoader:
+    """Extracts the sqlalchemy loader from info."""
+    if isinstance(info.context, dict):
+        return cast("StrawberrySQLAlchemyLoader", info.context["sqlalchemy_loader"])
+    else:
+        return cast("StrawberrySQLAlchemyLoader", info.context.sqlalchemy_loader)
+
+
+def _get_relationship_key(model: object, relationship: RelationshipProperty) -> Tuple[str, ...]:
+    """Return relationship key for data loader."""
+    return tuple(
+        getattr(model, local.key) for local, _ in relationship.local_remote_pairs or [] if local.key
+    )
 
 
 class WithStrawberrySQLAlchemyObjectDefinition(
@@ -268,8 +286,7 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
         interface (base of a polymorphic hierarchy)
         """
         return (
-            self._is_model_polymorphic(model)
-            and self._get_polymorphic_base_model(model) == model
+            self._is_model_polymorphic(model) and self._get_polymorphic_base_model(model) == model
         )
 
     def model_to_type_or_interface_name(self, model: Type[BaseModelType]) -> str:
@@ -328,9 +345,7 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
             setattr(connection_type, _IS_GENERATED_CONNECTION_TYPE_KEY, True)
         return self.connection_types[connection_name]
 
-    def _get_polymorphic_base_model(
-        self, model: Type[BaseModelType]
-    ) -> Type[BaseModelType]:
+    def _get_polymorphic_base_model(self, model: Type[BaseModelType]) -> Type[BaseModelType]:
         """
         Given a model, return the base of its inheritance tree (which may be itself).
         """
@@ -387,7 +402,7 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
         if relationship.uselist:
             # Use list if excluding relay pagination
             if use_list:
-                return List[ForwardRef(type_name)] # type: ignore
+                return List[ForwardRef(type_name)]  # type: ignore
 
             return self._connection_type_for(type_name)
         else:
@@ -403,14 +418,9 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
         if relationship.direction in [ONETOMANY, MANYTOMANY]:
             # many on other side means it's optional always
             return True
-        else:
-            assert relationship.direction == MANYTOONE
-            # this model is the one with the FK
-            local_col: ColumnElement
-            for local_col, _ in relationship.local_remote_pairs or []:
-                if local_col.nullable:
-                    return True
-            return False
+        assert relationship.direction == MANYTOONE
+        # this model is the one with the FK
+        return any(local_col.nullable for local_col, _ in relationship.local_remote_pairs or [])
 
     def _add_annotation(
         self, type_: Any, key: str, annotation: Any, generated_field_keys: List[str]
@@ -438,92 +448,215 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
         if descriptor.value_attr in in_between_mapper.relationships:
             relationship = in_between_mapper.relationships[descriptor.value_attr]
             is_multiple = is_multiple or relationship.uselist
-            strawberry_type = self._convert_relationship_to_strawberry_type(
-                relationship
-            )
+            strawberry_type = self._convert_relationship_to_strawberry_type(relationship)
         else:
             raise UnsupportedAssociationProxyTarget(key)
         if strawberry_type is SkipTypeSentinel:
             return strawberry_type
         if is_multiple and not self._is_connection_type(strawberry_type):
             if isinstance(strawberry_type, ForwardRef):
-                strawberry_type = self._connection_type_for(
-                    strawberry_type.__forward_arg__
-                )
+                strawberry_type = self._connection_type_for(strawberry_type.__forward_arg__)
             else:
                 strawberry_type = self._connection_type_for(strawberry_type.__name__)
         return strawberry_type
 
     def make_connection_wrapper_resolver(
-        self, resolver: Callable[..., Awaitable[Any]], type_name: str
+        self,
+        resolver: Callable[..., Awaitable[Any]],
+        relationship: RelationshipProperty,
     ) -> Callable[..., Awaitable[Any]]:
         """
         Wrap a resolver that returns an array of model types to return
         a Connection instead.
         """
+        type_name = self.model_to_type_or_interface_name(
+            relationship.entity.entity,  # type: ignore[arg-type]
+        )
         connection_type = self._connection_type_for(type_name)
         edge_type = self._edge_type_for(type_name)
 
-        async def wrapper(self, info: Info):
-            # TODO: Add pagination support to dataloader resolvers
-            edges = [
-                edge_type.resolve_edge(
-                    related_object,
-                    cursor=i,
+        async def wrapper(
+            self,
+            info: Info,
+            first: Optional[int] = None,
+            after: Optional[str] = None,
+            last: Optional[int] = None,
+            before: Optional[str] = None,
+        ):
+            # Pass pagination parameters to the resolver
+            related_objects = await resolver(
+                self, info, first=first, after=after, last=last, before=before
+            )
+
+            # Determine if there might be more results in forward or backward direction
+            has_more = False
+            has_more_previous = False
+
+            # For forward pagination, we have more if we got exactly the number requested
+            if first is not None and len(related_objects) == first:
+                has_more = True
+
+            # For backward pagination, we have more previous if we got exactly the number requested
+            if last is not None and len(related_objects) == last:
+                has_more_previous = True
+
+            total_count: Optional[int] = None
+            if last is not None or before is not None:
+                loader = _get_loader_from_info(info)
+                total_count = await loader.get_relationship_record_count_for_key(
+                    relationship, _get_relationship_key(self, relationship)
                 )
-                for i, related_object in enumerate(await resolver(self, info))
-            ]
-            return connection_type(
-                edges=edges,
-                page_info=relay.PageInfo(
-                    has_next_page=False,
-                    has_previous_page=False,
-                    start_cursor=edges[0].cursor if edges else None,
-                    end_cursor=edges[-1].cursor if edges else None,
-                ),
+
+            return StrawberrySQLAlchemyMapper._resolve_connection_edges(
+                related_objects,
+                edge_type,
+                connection_type,
+                first=first,
+                after=after,
+                last=last,
+                before=before,
+                total_count=total_count,
+                has_more=has_more,
+                has_more_previous=has_more_previous,
             )
 
         setattr(wrapper, _IS_GENERATED_RESOLVER_KEY, True)
 
         return wrapper
 
-    def relationship_resolver_for(
-        self, relationship: RelationshipProperty
-    ) -> Callable[..., Awaitable[Any]]:
+    @staticmethod
+    def _resolve_connection_edges(
+        related_objects,
+        edge_type,
+        connection_type,
+        first=None,
+        after=None,
+        last=None,
+        before=None,
+        total_count=None,
+        has_more=False,
+        has_more_previous=False,
+    ):
+        """Resolve connection edges with pagination support.
+
+        Args:
+            related_objects: The list of objects to include in the connection
+            edge_type: The edge type for the connection
+            connection_type: The connection type
+            first: Number of items requested from start (may be None)
+                - curr
+            after: Cursor string for forward pagination (may be None)
+            last: Number of items requested from end (may be None)
+            before: Cursor string for backward pagination (may be None)
+            total_count: Number of records in total (may be None)
+            has_more: Boolean indicating if there are more results after this page
+            has_more_previous: Boolean indicating if there are more results before this page
         """
-        Return an async field resolver for the given relationship,
+        # Determine if we have previous pages based on cursor or known state
+        has_previous_page = after is not None or has_more_previous
+
+        # For before/last pagination, we know we have next pages if before was provided
+        has_next_page = before is not None or has_more
+
+        if total_count is None and (last is not None or before is not None):
+            raise ValueError("total_count must be set for last/before.")
+
+        decoded_before_index = None if before is None else decode_cursor_index(before)
+        decoded_after_index = None if after is None else decode_cursor_index(after)
+        start_index = 0
+        if decoded_before_index is not None:
+            if last is not None:
+                start_index = max(0, decoded_before_index - last)
+            # otherwise, keep start index at 0
+        elif last is not None:
+            # Before is either invalid or not set; we're taking the last
+            # elements from the end
+            start_index = max(0, total_count - last)
+        else:
+            # Forward pagination is nicer
+            start_index = decoded_after_index or 0
+        edges = [
+            edge_type.resolve_edge(
+                related_object,
+                cursor=start_index + i,
+            )
+            for i, related_object in enumerate(related_objects)
+        ]
+
+        return connection_type(
+            edges=edges,
+            page_info=relay.PageInfo(
+                has_next_page=has_next_page,
+                has_previous_page=has_previous_page,
+                start_cursor=edges[0].cursor if edges else None,
+                end_cursor=edges[-1].cursor if edges else None,
+            ),
+        )
+
+    def relationship_resolver_for(
+        self,
+        relationship: RelationshipProperty,
+    ) -> Callable[..., Awaitable[Any]]:
+        """Return an async field resolver for the given relationship,
         so as to avoid n+1 query problem.
         """
 
-        async def resolve(self, info: Info):
-            instance_state = cast(InstanceState, inspect(self))
-            if relationship.key not in instance_state.unloaded:
-                related_objects = getattr(self, relationship.key)
-            else:
-                relationship_key = tuple(
-                    [
-                        getattr(self, local.key)
-                        for local, _ in relationship.local_remote_pairs or []
-                        if local.key
-                    ]
-                )
-                if any(item is None for item in relationship_key):
-                    if relationship.uselist:
-                        return []
-                    else:
-                        return None
-                if isinstance(info.context, dict):
-                    loader = info.context["sqlalchemy_loader"]
+        if relationship.uselist:
+
+            async def resolve_list(
+                self,
+                info: Info,
+                first: Optional[int] = None,
+                after: Optional[str] = None,
+                last: Optional[int] = None,
+                before: Optional[str] = None,
+            ):
+                instance_state = cast("InstanceState", inspect(self))
+                if relationship.key not in instance_state.unloaded:
+                    related_objects = getattr(self, relationship.key)
                 else:
-                    loader = info.context.sqlalchemy_loader
-                related_objects = await loader.loader_for(relationship).load(
-                    relationship_key
-                )
-            return related_objects
+                    relationship_key = _get_relationship_key(
+                        self,
+                        relationship,
+                    )
+                    if any(item is None for item in relationship_key):
+                        return []
 
-        setattr(resolve, _IS_GENERATED_RESOLVER_KEY, True)
+                    loader = _get_loader_from_info(info)
 
-        return resolve
+                    related_objects = await loader.loader_for(relationship).load(
+                        relationship_key,
+                        first=first,
+                        after=after,
+                        last=last,
+                        before=before,
+                    )
+                return related_objects
+
+            setattr(resolve_list, _IS_GENERATED_RESOLVER_KEY, True)
+            return resolve_list
+
+        else:
+
+            async def resolve(self, info: Info):
+                instance_state = cast("InstanceState", inspect(self))
+                if relationship.key not in instance_state.unloaded:
+                    related_objects = getattr(self, relationship.key)
+                else:
+                    relationship_key = _get_relationship_key(
+                        self,
+                        relationship,
+                    )
+                    if any(item is None for item in relationship_key):
+                        return None
+                    loader = _get_loader_from_info(info)
+                    related_objects = await loader.loader_for(relationship).load(
+                        relationship_key,
+                    )
+                return related_objects
+
+            setattr(resolve, _IS_GENERATED_RESOLVER_KEY, True)
+            return resolve
 
     def connection_resolver_for(
         self, relationship: RelationshipProperty, use_list=False
@@ -531,12 +664,15 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
         """
         Return an async field resolver for the given relationship that
         returns a Connection instead of an array of objects.
+
+        This resolver also handles pagination arguments (first, after, last, before) that are
+        passed from the GraphQL query to the database query.
         """
         relationship_resolver = self.relationship_resolver_for(relationship)
         if relationship.uselist and not use_list:
             return self.make_connection_wrapper_resolver(
                 relationship_resolver,
-                self.model_to_type_or_interface_name(relationship.entity.entity),  # type: ignore[arg-type]
+                relationship,
             )
         else:
             return relationship_resolver
@@ -548,7 +684,10 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
         return getattr(type_, _IS_GENERATED_CONNECTION_TYPE_KEY, False)
 
     def association_proxy_resolver_for(
-        self, mapper: Mapper, descriptor: Any, strawberry_type: Type
+        self,
+        mapper: Mapper,
+        descriptor: Any,
+        strawberry_type: Type,
     ) -> Callable[..., Awaitable[Any]]:
         """
         Return an async field resolver for the given association proxy.
@@ -572,17 +711,22 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
             in_between_objects = await in_between_resolver(self, info)
             if in_between_objects is None:
                 if is_multiple:
-                    return connection_type(edges=[])
+                    return connection_type(
+                        edges=[],
+                        page_info=relay.PageInfo(
+                            has_next_page=False,
+                            has_previous_page=False,
+                            start_cursor=None,
+                            end_cursor=None,
+                        ),
+                    )
                 else:
                     return None
             if descriptor.value_attr in in_between_mapper.relationships:
                 assert end_relationship_resolver is not None
                 if isinstance(in_between_objects, collections.abc.Iterable):
                     outputs = await asyncio.gather(
-                        *[
-                            end_relationship_resolver(obj, info)
-                            for obj in in_between_objects
-                        ]
+                        *[end_relationship_resolver(obj, info) for obj in in_between_objects]
                     )
                     if outputs and isinstance(outputs[0], list):
                         outputs = list(chain.from_iterable(outputs))
@@ -592,14 +736,22 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
                     outputs = await end_relationship_resolver(in_between_objects, info)
                 if not isinstance(outputs, collections.abc.Iterable):
                     return outputs
-                return connection_type(edges=[edge_type(node=obj) for obj in outputs])
+                return StrawberrySQLAlchemyMapper._resolve_connection_edges(
+                    outputs,
+                    edge_type,
+                    connection_type,
+                    first=None,
+                    after=None,
+                    last=None,
+                    before=None,
+                    total_count=None,
+                    has_more=False,
+                    has_more_previous=False,
+                )
             else:
                 assert descriptor.value_attr in in_between_mapper.columns
                 if isinstance(in_between_objects, collections.abc.Iterable):
-                    return [
-                        getattr(obj, descriptor.value_attr)
-                        for obj in in_between_objects
-                    ]
+                    return [getattr(obj, descriptor.value_attr) for obj in in_between_objects]
                 else:
                     return getattr(in_between_objects, descriptor.value_attr)
 
@@ -618,11 +770,7 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
         """
         column: Column
         for key, column in mapper.columns.items():
-            if (
-                key in excluded_keys
-                or key in type_.__annotations__
-                or hasattr(type_, key)
-            ):
+            if key in excluded_keys or key in type_.__annotations__ or hasattr(type_, key):
                 continue
             type_annotation = self._convert_column_to_strawberry_type(column)
             if type_annotation is not SkipTypeSentinel:
@@ -638,6 +786,7 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
         model: Type[BaseModelType],
         make_interface=False,
         use_federation=False,
+        directives: Union[Sequence[object], None] = (),
     ) -> Callable[[Type[object]], Any]:
         """
         Decorate a type with this to register it as a strawberry type
@@ -659,38 +808,52 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
         ```
         """
 
-        def convert(type_: Any) -> Any:
-            old_annotations = getattr(type_, "__annotations__", {})
-            type_.__annotations__ = {
-                k: v for k, v in old_annotations.items() if is_private(v)
-            }
-            mapper: Mapper = cast(Mapper, inspect(model))
-            generated_field_keys = []
+        def _get_generated_field_keys(type_, old_annotations) -> Tuple[List[str], Dict[str, Any]]:
+            old_annotations = old_annotations.copy()
+            generated_field_keys = set()
 
-            excluded_keys = getattr(type_, "__exclude__", [])
-            list_keys = getattr(type_, "__use_list__", [])
-
-            # if the type inherits from another mapped type, then it may have
-            # generated resolvers. These will be treated by dataclasses as having
-            # a default value, which will likely cause issues because of keys
-            # that don't have default values. To fix this, we wrap them in
-            # `strawberry.field()` (like when they were originally made), so
-            # dataclasses will ignore them.
-            # TODO: Potentially raise/fix this issue upstream
             for key in dir(type_):
                 val = getattr(type_, key)
                 if getattr(val, _IS_GENERATED_RESOLVER_KEY, False):
                     setattr(type_, key, field(resolver=val))
-                    generated_field_keys.append(key)
+                    generated_field_keys.add(key)
+
+            # Checks for an original type annotation, useful in resolving inheritance-related types
+            if original_type := getattr(type_, _ORIGINAL_TYPE_KEY, None):
+                for key in dir(original_type):
+                    if key.startswith("__") and key.endswith("__"):
+                        continue
+
+                    val = getattr(original_type, key)
+                    if getattr(val, _IS_GENERATED_RESOLVER_KEY, False):
+                        setattr(type_, key, field(resolver=val))
+                        generated_field_keys.add(key)
+                        try:
+                            annotations = get_type_hints(original_type)
+                        except Exception:
+                            annotations = original_type.__annotations__
+
+                        if key in annotations:
+                            old_annotations[key] = annotations[key]
+
+            return list(generated_field_keys), old_annotations
+
+        def convert(type_: Any) -> Any:
+            old_annotations = getattr(type_, "__annotations__", {})
+            type_.__annotations__ = {k: v for k, v in old_annotations.items() if is_private(v)}
+            mapper: Mapper = cast("Mapper", inspect(model))
+
+            excluded_keys = getattr(type_, "__exclude__", [])
+            list_keys = getattr(type_, "__use_list__", [])
+
+            generated_field_keys, old_annotations = _get_generated_field_keys(
+                type_, old_annotations
+            )
 
             self._handle_columns(mapper, type_, excluded_keys, generated_field_keys)
             relationship: RelationshipProperty
             for key, relationship in mapper.relationships.items():
-                if (
-                    key in excluded_keys
-                    or key in type_.__annotations__
-                    or hasattr(type_, key)
-                ):
+                if key in excluded_keys or key in type_.__annotations__ or hasattr(type_, key):
                     continue
                 strawberry_type = self._convert_relationship_to_strawberry_type(
                     relationship,
@@ -703,7 +866,7 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
                     generated_field_keys,
                 )
                 sqlalchemy_field = cast(
-                    StrawberryField,
+                    "StrawberryField",
                     field(
                         resolver=self.connection_resolver_for(
                             relationship,
@@ -718,11 +881,7 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
                     sqlalchemy_field,
                 )
             for key, descriptor in mapper.all_orm_descriptors.items():
-                if (
-                    key in excluded_keys
-                    or key in type_.__annotations__
-                    or hasattr(type_, key)
-                ):
+                if key in excluded_keys or key in type_.__annotations__ or hasattr(type_, key):
                     continue
                 if key in mapper.columns or key in mapper.relationships:
                     continue
@@ -733,9 +892,7 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
                         strawberry_type,
                     ) in self.sqlalchemy_type_to_strawberry_type_map.items():
                         if isinstance(annotation, sqlalchemy_type):
-                            self._add_annotation(
-                                type_, key, strawberry_type, generated_field_keys
-                            )
+                            self._add_annotation(type_, key, strawberry_type, generated_field_keys)
                             break
                 elif isinstance(descriptor, AssociationProxy):
                     strawberry_type = self._get_association_proxy_annotation(  # type: ignore[assignment]
@@ -743,11 +900,9 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
                     )
                     if strawberry_type is SkipTypeSentinel:
                         continue
-                    self._add_annotation(
-                        type_, key, strawberry_type, generated_field_keys
-                    )
+                    self._add_annotation(type_, key, strawberry_type, generated_field_keys)
                     sqlalchemy_field = cast(
-                        StrawberryField,
+                        "StrawberryField",
                         field(
                             resolver=self.association_proxy_resolver_for(
                                 mapper,
@@ -784,9 +939,7 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
 
             # ignore inherited `is_type_of`
             if "is_type_of" not in type_.__dict__:
-                type_.is_type_of = (
-                    lambda obj, info: type(obj) == model or type(obj) == type_
-                )
+                type_.is_type_of = lambda obj, info: type(obj) is model or type(obj) is type_
 
             # Default querying methods for relay
             if issubclass(type_, relay.Node):
@@ -799,8 +952,7 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
                     existing_resolver = getattr(type_, attr, None)
                     if (
                         existing_resolver is None
-                        or existing_resolver.__func__
-                        is getattr(relay.Node, attr).__func__
+                        or existing_resolver.__func__ is getattr(relay.Node, attr).__func__
                     ):
                         setattr(
                             type_,
@@ -811,14 +963,11 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
                     # Adjust types that inherit from other types/interfaces that implement Node
                     # to make sure they pass themselves as the node type
                     meth = getattr(type_, attr)
-                    if (
-                        isinstance(meth, types.MethodType)
-                        and meth.__self__ is not type_
-                    ):
+                    if isinstance(meth, types.MethodType) and meth.__self__ is not type_:
                         setattr(
                             type_,
                             attr,
-                            types.MethodType(cast(classmethod, meth).__func__, type_),
+                            types.MethodType(cast("classmethod", meth).__func__, type_),
                         )
 
             # need to make fields that are already in the type
@@ -826,16 +975,26 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
             # because the pre-existing fields might have default values,
             # which will cause the mapped fields to fail
             # (because they may not have default values)
-            type_.__annotations__.update(old_annotations)
+
+            # For Python versions <= 3.9, only update annotations that don't already exist
+            # because this versions handle inherance differently
+            if sys.version_info[:2] <= (3, 9):
+                for k, v in old_annotations.items():
+                    if k not in type_.__annotations__:
+                        type_.__annotations__[k] = v
+            else:
+                type_.__annotations__.update(old_annotations)
 
             if make_interface:
                 mapped_type = strawberry.interface(type_)
                 self.mapped_interfaces[type_.__name__] = mapped_type
             elif use_federation:
-                mapped_type = strawberry.federation.type(type_)
+                mapped_type = strawberry.federation.type(
+                    type_, directives=directives if directives else ()
+                )
                 self.mapped_types[type_.__name__] = mapped_type
             else:
-                mapped_type = strawberry.type(type_)
+                mapped_type = strawberry.type(type_, directives=directives)
                 self.mapped_types[type_.__name__] = mapped_type
 
             setattr(
@@ -903,9 +1062,7 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
                     if f.type_annotation is not None:
                         f.type_annotation.namespace = namespace
                     else:
-                        f.type_annotation = StrawberryAnnotation(
-                            f.type, namespace=namespace
-                        )
+                        f.type_annotation = StrawberryAnnotation(f.type, namespace=namespace)
 
     def _map_unmapped_relationships(self) -> None:
         """
@@ -926,9 +1083,5 @@ class StrawberrySQLAlchemyMapper(Generic[BaseModelType]):
             for model in unmapped_models:
                 self.type(model)(type(self.model_to_type_name(model), (object,), {}))
             for model in unmapped_interface_models:
-                self.interface(model)(
-                    type(self.model_to_interface_name(model), (object,), {})
-                )
-            unmapped_model_found = (
-                len(unmapped_models) > 0 or len(unmapped_interface_models) > 0
-            )
+                self.interface(model)(type(self.model_to_interface_name(model), (object,), {}))
+            unmapped_model_found = len(unmapped_models) > 0 or len(unmapped_interface_models) > 0
