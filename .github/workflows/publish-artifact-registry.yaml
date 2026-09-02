@@ -8,6 +8,8 @@ on:
   push:
     tags:
       - "relay-v*"
+    branches:
+      - relay-main
   workflow_dispatch:
 
 permissions:
