@@ -2,6 +2,7 @@ name: Publish to Artifact Registry
 
 # Relay-specific. Upstream's release.yml publishes to PyPI on push to main; this
 # publishes our patched build to Relay's private registries and never runs on main.
+# Exception to Relay's monorepo pattern; only exists because this fork can't live there.
 
 on:
   push:
