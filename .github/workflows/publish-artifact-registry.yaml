@@ -7,6 +7,8 @@ on:
   push:
     tags:
       - "relay-v*"
+    branches:
+      - "relay/publish-to-artifact-registry"
   workflow_dispatch:
 
 permissions:
