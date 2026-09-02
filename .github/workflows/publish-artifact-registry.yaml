@@ -1,0 +1,38 @@
+name: Publish to Artifact Registry
+
+# Relay-specific. Upstream's release.yml publishes to PyPI on push to main; this
+# publishes our patched build to Relay's private registry and never runs on main.
+
+on:
+  push:
+    tags:
+      - "relay-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency: publish-artifact-registry
+
+jobs:
+  publish:
+    name: Build and publish wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: relaytech-sandbox
+          workload_identity_provider: ${{ vars.SANDBOX_WORKLOAD_IDENTITY }}
+
+      - name: Build and publish
+        run: ./scripts/publish-to-artifact-registry.sh
+        env:
+          AR_REPOSITORY_URL: https://europe-west1-python.pkg.dev/relaytech-sandbox/relaycode-python/
