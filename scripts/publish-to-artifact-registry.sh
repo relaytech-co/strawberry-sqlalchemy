@@ -17,11 +17,13 @@ VERSION=$(poetry version --short)
 
 # Artifact Registry versions are immutable, so re-uploading one is a 400 rather
 # than a no-op. Skip so re-runs and the second half of the matrix stay green.
-if gcloud artifacts versions describe "${VERSION}" \
+# `versions describe` cannot address a version containing '+', so list and match
+if gcloud artifacts versions list \
   --package="${PACKAGE}" \
   --repository="${AR_REPOSITORY}" \
   --location="${AR_LOCATION}" \
-  --project="${AR_PROJECT}" >/dev/null 2>&1; then
+  --project="${AR_PROJECT}" \
+  --format="value(name.basename())" 2>/dev/null | grep -qxF "${VERSION}"; then
   echo "${PACKAGE} ${VERSION} is already published to ${AR_PROJECT}; nothing to do"
   exit 0
 fi
